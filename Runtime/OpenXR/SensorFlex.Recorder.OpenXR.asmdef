@@ -1,0 +1,25 @@
+{
+  "name": "SensorFlex.Recorder.OpenXR",
+  "rootNamespace": "SensorFlex.Recorder",
+  "references": [
+    "SensorFlex.Recorder.Runtime",
+    "Unity.XR.OpenXR"
+  ],
+  "includePlatforms": [],
+  "excludePlatforms": [],
+  "allowUnsafeCode": true,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": [
+    "SF_OPENXR"
+  ],
+  "versionDefines": [
+    {
+      "name": "com.unity.xr.openxr",
+      "expression": "1.0.0",
+      "define": "SF_OPENXR"
+    }
+  ],
+  "noEngineReferences": false
+}

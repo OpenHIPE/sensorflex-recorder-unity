@@ -8,32 +8,22 @@ namespace SensorFlex.Recorder
     //
     // session.json — session metadata and the sensor list:
     //   { "sfz_version":"2.0", "session_id":"...", ..., "frame_source":"color",
-    //     "sensors": {
-    //       "color": {"type":"color","file":"color.mp4","encoding":"hevc_mp4","width":W,"height":H},
-    //       "depth": {"type":"depth","file":"depth.bin","encoding":"lz4_uint16","width":w,"height":h,
-    //                 "units":"millimeters","source":"arcore_environment_depth"} } }
+    //     "sensors": { "color": {"type":"color","file":"color.mp4","encoding":"hevc_mp4","width":W,"height":H},
+    //                  "depth": {"type":"depth","file":"depth.bin","encoding":"lz4_uint16",...} } }
     //
-    // frames.jsonl — one line per frame, one block per sensor:
-    //   {"frame":0,"ts":T,
-    //    "color":{"ts":T,"index":0,"pos":[..],"rot":[..],"fx":..,"fy":..,"cx":..,"cy":..},
-    //    "depth":{"ts":T,"index":0,"pos":[..],"rot":[..],"fx":..,"fy":..,"cx":..,"cy":..,"off":0,"sz":12345}}
+    // frames.jsonl — one line per frame, one block per sensor with a sample:
+    //   {"frame":0,"ts":T,"color":{"ts":T,"index":0,"pos":[..],"rot":[..],"fx":..,"fy":..,"cx":..,"cy":..},
+    //    "depth":{"ts":T,"index":0,"pos":[..],"rot":[..],"fx":..,...,"off":0,"sz":12345}}
     //
-    // Handheld rig: depth is captured from the color camera's viewpoint at the frame's time, so
-    // the depth block repeats the color pose and timestamp with intrinsics scaled to the depth
-    // resolution. color.index is the frame's index in color.mp4 (-1 = dropped); depth.index
-    // counts depth samples. depth_sizes.bin holds one entry per frame with HasDepth == true.
+    // Block depth sensors get off/sz from their per-block sizes (one int32 per written block,
+    // in index order): off = sum of the sizes of the blocks before it.
     internal static class SfzSerializer
     {
-        const string ColorSensor = "color";
-        const string DepthSensor = "depth";
-
-        static bool IsVideoDepth(SfzDepthCodec codec) => codec == SfzDepthCodec.HEVC || codec == SfzDepthCodec.H264;
-
         // ── session.json ──────────────────────────────────────────────────────
 
         public static byte[] BuildSessionJson(SfzSessionMetadata meta)
         {
-            var sb = new StringBuilder(768);
+            var sb = new StringBuilder(1024);
             sb.Append("{\n");
             AppendStr(sb, "sfz_version",    "2.0",              1, true);
             AppendStr(sb, "session_id",     meta.SessionId,     1, true);
@@ -47,42 +37,35 @@ namespace SensorFlex.Recorder
 
             AppendInt(sb, "actual_fps",   meta.Fps,          1, true);
             AppendInt(sb, "frame_count",  meta.FrameCount,   1, true);
-            AppendStr(sb, "frame_source", ColorSensor,       1, true);
+            AppendStr(sb, "frame_source", meta.FrameSource,  1, true);
 
-            sb.Append("  \"sensors\": {\n");
-
-            // The color sensor always exists: it is the frame source and carries the camera
-            // pose. Without captured video it has no file (all its blocks have index -1).
-            sb.Append("    \"").Append(ColorSensor).Append("\": { \"type\": \"color\"");
-            if (meta.HasRgb)
+            sb.Append("  \"sensors\": {");
+            var sensors = meta.Sensors ?? new List<SfzSensorInfo>();
+            for (int i = 0; i < sensors.Count; i++)
             {
-                string colorEncoding = meta.RgbCodec == SfzRgbCodec.H264 ? "h264_mp4" : "hevc_mp4";
-                sb.Append(", \"file\": \"").Append(CaptureBackend.ColorFileName).Append('"');
-                sb.Append(", \"encoding\": \"").Append(colorEncoding).Append('"');
-                sb.Append(", \"width\": ").Append(meta.RgbWidth);
-                sb.Append(", \"height\": ").Append(meta.RgbHeight);
-            }
-            sb.Append(" }");
-
-            if (meta.HasDepth)
-            {
-                string depthEncoding = meta.DepthEncoding ?? "lz4_float32";
-                string depthFile     = IsVideoDepth(meta.DepthCodec) ? "depth.mp4" : "depth.bin";
-                sb.Append(",\n    \"").Append(DepthSensor).Append("\": { \"type\": \"depth\"");
-                sb.Append(", \"file\": \"").Append(depthFile).Append('"');
-                sb.Append(", \"encoding\": \"").Append(depthEncoding).Append('"');
-                sb.Append(", \"width\": ").Append(meta.DepthWidth);
-                sb.Append(", \"height\": ").Append(meta.DepthHeight);
-                sb.Append(", \"units\": \"");
-                AppendEscaped(sb, meta.DepthUnits ?? "meters");
-                sb.Append("\", \"source\": \"");
-                AppendEscaped(sb, meta.DepthSensor ?? "arfoundation_environment_depth");
+                var s = sensors[i];
+                sb.Append(i == 0 ? "\n" : ",\n");
+                sb.Append("    \"");
+                AppendEscaped(sb, s.Name);
+                sb.Append("\": { \"type\": \"");
+                AppendEscaped(sb, s.Type);
                 sb.Append('"');
-                if (depthEncoding.EndsWith("_uint8_norm"))
-                    sb.Append(", \"depth_max_meters\": ").Append(F(meta.DepthMaxMeters));
+                if (!string.IsNullOrEmpty(s.File))
+                {
+                    AppendField(sb, "file",     s.File);
+                    AppendField(sb, "encoding", s.Encoding);
+                    sb.Append(", \"width\": ").Append(s.Width);
+                    sb.Append(", \"height\": ").Append(s.Height);
+                    if (s.Type == "depth")
+                    {
+                        AppendField(sb, "units",  s.Units ?? "meters");
+                        AppendField(sb, "source", s.Source ?? "unknown");
+                        if (s.DepthMaxMeters > 0f)
+                            sb.Append(", \"depth_max_meters\": ").Append(F(s.DepthMaxMeters));
+                    }
+                }
                 sb.Append(" }");
             }
-
             sb.Append("\n  }\n");
             sb.Append("}\n");
             return Encoding.UTF8.GetBytes(sb.ToString());
@@ -90,48 +73,58 @@ namespace SensorFlex.Recorder
 
         // ── frames.jsonl ──────────────────────────────────────────────────────
 
-        // depthSizes holds the compressed byte count of each depth block, one per frame with
-        // HasDepth (block encodings only; null for video depth).
-        public static byte[] BuildFramesJsonl(SfzSessionMetadata meta, List<SfzFrameRecord> frames, int[] depthSizes)
+        // blockSizes: per block-depth sensor name, the compressed size of each written block.
+        public static byte[] BuildFramesJsonl(List<SfzFrame> frames, Dictionary<string, int[]> blockSizes)
         {
-            bool isVideoDepth = IsVideoDepth(meta.DepthCodec);
-            float sx = meta.RgbWidth  > 0 ? (float)meta.DepthWidth  / meta.RgbWidth  : 0f;
-            float sy = meta.RgbHeight > 0 ? (float)meta.DepthHeight / meta.RgbHeight : 0f;
+            // Prefix sums → byte offset of each block.
+            var offsets = new Dictionary<string, long[]>();
+            foreach (var kv in blockSizes)
+            {
+                var off = new long[kv.Value.Length];
+                long acc = 0;
+                for (int i = 0; i < off.Length; i++) { off[i] = acc; acc += kv.Value[i]; }
+                offsets[kv.Key] = off;
+            }
 
-            var  sb          = new StringBuilder(frames.Count * 320);
-            long depthOffset = 0L;
-            int  depthIndex  = 0;
-
+            var sb = new StringBuilder(frames.Count * 360);
             for (int i = 0; i < frames.Count; i++)
             {
-                var f = frames[i];
+                var frame = frames[i];
+                sb.Append("{\"frame\":").Append(i);
+                sb.Append(",\"ts\":").Append(frame.TimestampNs);
 
-                sb.Append("{\"frame\":").Append(f.FrameIndex);
-                sb.Append(",\"ts\":").Append(f.TimestampNs);
-
-                // color block — the camera pose lives here even when the image was dropped.
-                sb.Append(",\"").Append(ColorSensor).Append("\":{");
-                AppendSampleHeader(sb, f, meta.HasRgb ? f.ColorIndex : -1);
-                if (f.HasIntrinsics)
-                    AppendIntrinsics(sb, f.Fx, f.Fy, f.Cx, f.Cy);
-                sb.Append('}');
-
-                // depth block — only for frames that produced a depth sample.
-                if (meta.HasDepth && f.HasDepth)
+                foreach (var kv in frame.Samples)
                 {
-                    sb.Append(",\"").Append(DepthSensor).Append("\":{");
-                    AppendSampleHeader(sb, f, depthIndex);
-                    if (f.HasIntrinsics && sx > 0f && sy > 0f)
-                        AppendIntrinsics(sb, f.Fx * sx, f.Fy * sy, f.Cx * sx, f.Cy * sy);
-                    if (!isVideoDepth)
+                    var s = kv.Value;
+                    sb.Append(",\"");
+                    AppendEscaped(sb, kv.Key);
+                    sb.Append("\":{\"ts\":").Append(s.TimestampNs);
+                    sb.Append(",\"index\":").Append(s.Index);
+                    sb.Append(",\"pos\":[")
+                      .Append(F(s.Position.x)).Append(',')
+                      .Append(F(s.Position.y)).Append(',')
+                      .Append(F(s.Position.z))
+                      .Append(']');
+                    sb.Append(",\"rot\":[")
+                      .Append(F(s.Rotation.x)).Append(',')
+                      .Append(F(s.Rotation.y)).Append(',')
+                      .Append(F(s.Rotation.z)).Append(',')
+                      .Append(F(s.Rotation.w))
+                      .Append(']');
+                    if (s.HasIntrinsics)
                     {
-                        int dsz = depthSizes != null && depthIndex < depthSizes.Length ? depthSizes[depthIndex] : 0;
-                        sb.Append(",\"off\":").Append(depthOffset);
-                        sb.Append(",\"sz\":").Append(dsz);
-                        depthOffset += dsz;
+                        sb.Append(",\"fx\":").Append(F(s.Fx));
+                        sb.Append(",\"fy\":").Append(F(s.Fy));
+                        sb.Append(",\"cx\":").Append(F(s.Cx));
+                        sb.Append(",\"cy\":").Append(F(s.Cy));
+                    }
+                    if (blockSizes.TryGetValue(kv.Key, out var sizes))
+                    {
+                        bool has = s.Index >= 0 && s.Index < sizes.Length;
+                        sb.Append(",\"off\":").Append(has ? offsets[kv.Key][s.Index] : 0);
+                        sb.Append(",\"sz\":").Append(has ? sizes[s.Index] : 0);
                     }
                     sb.Append('}');
-                    depthIndex++;
                 }
 
                 sb.Append("}\n");
@@ -140,32 +133,12 @@ namespace SensorFlex.Recorder
             return Encoding.UTF8.GetBytes(sb.ToString());
         }
 
-        static void AppendSampleHeader(StringBuilder sb, SfzFrameRecord f, int index)
+        static void AppendField(StringBuilder sb, string key, string value)
         {
-            sb.Append("\"ts\":").Append(f.TimestampNs);
-            sb.Append(",\"index\":").Append(index);
-            sb.Append(",\"pos\":[")
-              .Append(F(f.Position.x)).Append(',')
-              .Append(F(f.Position.y)).Append(',')
-              .Append(F(f.Position.z))
-              .Append(']');
-            sb.Append(",\"rot\":[")
-              .Append(F(f.Rotation.x)).Append(',')
-              .Append(F(f.Rotation.y)).Append(',')
-              .Append(F(f.Rotation.z)).Append(',')
-              .Append(F(f.Rotation.w))
-              .Append(']');
+            sb.Append(", \"").Append(key).Append("\": \"");
+            AppendEscaped(sb, value ?? string.Empty);
+            sb.Append('"');
         }
-
-        static void AppendIntrinsics(StringBuilder sb, float fx, float fy, float cx, float cy)
-        {
-            sb.Append(",\"fx\":").Append(F(fx));
-            sb.Append(",\"fy\":").Append(F(fy));
-            sb.Append(",\"cx\":").Append(F(cx));
-            sb.Append(",\"cy\":").Append(F(cy));
-        }
-
-        // ── Helpers ────────────────────────────────────────────────────────────
 
         static void AppendStr(StringBuilder sb, string key, string value, int indent, bool comma)
         {

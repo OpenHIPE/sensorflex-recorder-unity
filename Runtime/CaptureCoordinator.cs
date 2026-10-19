@@ -11,11 +11,13 @@ namespace SensorFlex.Recorder
     // Subscribes to ARFoundation callbacks, builds per-frame SfzFrameRecords in memory,
     // and hands color/depth images to a platform CaptureBackend:
     //
-    //   iOS     — IosCaptureBackend     (ARKit  → SFVideoEncoder.mm)
-    //   Android — AndroidCaptureBackend (ARCore → SFVideoEncoderAndroid.java / C# LZ4)
-    //   Other   — NullCaptureBackend    (pose + metadata only, warnings emitted)
+    //   iOS        — IosCaptureBackend       (ARKit  → SFVideoEncoder.mm)
+    //   Android    — AndroidCaptureBackend   (ARCore → SFVideoEncoderAndroid.java / C# LZ4)
+    //   Android XR — AndroidXrCaptureBackend (frame-driving: Camera2 color + per-eye OpenXR depth)
+    //   Other      — NullCaptureBackend      (pose + metadata only, warnings emitted)
     //
-    // FrameRecords are kept in memory; ArchiveFinalizer consumes them to build frames.jsonl.
+    // Handheld backends get one SfzFrameRecord per AR camera frame, converted to generic SfzFrames
+    // at StopCapture; frame-driving backends produce SfzFrames themselves from Tick().
     internal sealed class CaptureCoordinator : IDisposable
     {
         // ── Public state ───────────────────────────────────────────────────
@@ -24,6 +26,8 @@ namespace SensorFlex.Recorder
         public string                SessionId       { get; }
         public SfzSessionMetadata    SessionMetadata { get; private set; }
         public List<SfzFrameRecord>  FrameRecords    { get; } = new List<SfzFrameRecord>(4096);
+        public List<SfzFrame>        Frames          { get; private set; } = new List<SfzFrame>();
+        public CaptureBackend        Backend         => _backend;
 
         // Set to true when the max recording duration is reached.
         public bool LimitReached { get; private set; }
@@ -54,7 +58,6 @@ namespace SensorFlex.Recorder
         float _cachedFx, _cachedFy, _cachedCx, _cachedCy;
 
         long _firstTimestampNs;
-        long _lastTimestampNs;
 
         long _maxDurationNs;
 
@@ -107,6 +110,12 @@ namespace SensorFlex.Recorder
                 ConfigureDepthMode();
 
             Directory.CreateDirectory(TempDir);
+            if (_backend.DrivesFrames)
+            {
+                // Frame-driving backends do not depend on AR camera frames.
+                HasDims = _backend.TryDetectDims(_cameraManager, _occlusionManager);
+                return true;
+            }
             if (!_standbySubscribed)
             {
                 _standbySubscribed = true;
@@ -138,7 +147,6 @@ namespace SensorFlex.Recorder
             _warnedDropped           = false;
             _warnedMissingIntrinsics = false;
             _firstTimestampNs        = 0;
-            _lastTimestampNs         = 0;
             LimitReached             = false;
             _maxDurationNs           = _config.MaxRecordingSeconds > 0
                                          ? (long)(_config.MaxRecordingSeconds * 1_000_000_000.0)
@@ -149,7 +157,9 @@ namespace SensorFlex.Recorder
             if (_captureDepthEnabled && _occlusionManager != null)
                 ConfigureDepthMode();
 
-            _cameraManager.frameReceived += OnCameraFrameReceived;
+            _backend.OnCaptureBegin(_mainCamera, TrackingSpace, _occlusionManager);
+            if (!_backend.DrivesFrames)
+                _cameraManager.frameReceived += OnCameraFrameReceived;
             _isCapturing = true;
 
             Debug.Log($"[SF-Recorder] Recording begun (pre-warmed={EnginesStarted}). TempDir='{TempDir}'");
@@ -217,7 +227,6 @@ namespace SensorFlex.Recorder
             _warnedDropped           = false;
             _warnedMissingIntrinsics = false;
             _firstTimestampNs        = 0;
-            _lastTimestampNs         = 0;
             LimitReached             = false;
             _maxDurationNs           = _config.MaxRecordingSeconds > 0
                                          ? (long)(_config.MaxRecordingSeconds * 1_000_000_000.0)
@@ -225,7 +234,9 @@ namespace SensorFlex.Recorder
             FrameRecords.Clear();
 
             Directory.CreateDirectory(TempDir);
-            _cameraManager.frameReceived += OnCameraFrameReceived;
+            _backend.OnCaptureBegin(_mainCamera, TrackingSpace, _occlusionManager);
+            if (!_backend.DrivesFrames)
+                _cameraManager.frameReceived += OnCameraFrameReceived;
             _isCapturing = true;
 
             Debug.Log($"[SF-Recorder] Capture started. TempDir='{TempDir}' Depth={_captureDepthEnabled} MaxSeconds={_config.MaxRecordingSeconds}");
@@ -242,30 +253,22 @@ namespace SensorFlex.Recorder
 
             _backend.Finish();
 
+            Frames = _backend.DrivesFrames ? (_backend.Frames ?? new List<SfzFrame>()) : BuildHandheldFrames();
+
             SessionMetadata = new SfzSessionMetadata
             {
-                SessionId      = SessionId,
-                StartTimeUtc   = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
-                DeviceModel    = SystemInfo.deviceModel,
-                DeviceOs       = SystemInfo.operatingSystem,
-                ArFramework    = ResolveCaptureFramework(),
-                Fps            = ComputeActualFps(),
-                FrameCount     = FrameRecords.Count,
-                HasRgb         = _backend.HasColorDims,
-                RgbWidth       = _backend.ColorWidth,
-                RgbHeight      = _backend.ColorHeight,
-                HasDepth       = _backend.HasDepthDims,
-                DepthWidth     = _backend.DepthWidth,
-                DepthHeight    = _backend.DepthHeight,
-                DepthSensor    = _backend.DepthSensor,
-                DepthEncoding  = _backend.DepthEncoding,
-                DepthUnits     = _backend.DepthUnits,
-                RgbCodec       = _config.RgbCodec,
-                DepthCodec     = _config.DepthCodec,
-                DepthMaxMeters = _config.DepthMaxMeters,
+                SessionId    = SessionId,
+                StartTimeUtc = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
+                DeviceModel  = SystemInfo.deviceModel,
+                DeviceOs     = SystemInfo.operatingSystem,
+                ArFramework  = _backend.ArFramework,
+                Fps          = ComputeActualFps(Frames),
+                FrameCount   = Frames.Count,
+                FrameSource  = CaptureBackend.ColorSensor,
+                Sensors      = _backend.DescribeSensors(),
             };
 
-            Debug.Log($"[SF-Recorder] Capture stopped. Frames={FrameRecords.Count} ActualFPS={SessionMetadata.Fps}");
+            Debug.Log($"[SF-Recorder] Capture stopped. Frames={Frames.Count} ActualFPS={SessionMetadata.Fps}");
         }
 
         public void Dispose()
@@ -279,6 +282,60 @@ namespace SensorFlex.Recorder
             StopCapture();
         }
 
+        // Called every Update by ARSensorFlexRecorder; drives frame-driving backends.
+        public void Tick()
+        {
+            if (!_isCapturing || !_backend.DrivesFrames) return;
+            _backend.Tick();
+
+            long latest = _backend.LatestFrameTimestampNs;
+            if (latest == 0) return;
+            if (_firstTimestampNs == 0) _firstTimestampNs = latest;
+            if (_maxDurationNs > 0 && latest - _firstTimestampNs >= _maxDurationNs)
+            {
+                StopCapture();
+                LimitReached = true;
+            }
+        }
+
+        // The camera's parent: the tracking-space root whose transform maps session poses to world.
+        Transform TrackingSpace => _mainCamera != null ? _mainCamera.transform.parent : null;
+
+        // Handheld rig → generic frames: "color" carries the camera pose; "depth" (from the color
+        // camera's viewpoint) repeats it with intrinsics scaled to the depth resolution.
+        List<SfzFrame> BuildHandheldFrames()
+        {
+            var frames   = new List<SfzFrame>(FrameRecords.Count);
+            bool hasRgb  = _backend.HasColorDims;
+            bool hasDep  = _backend.HasDepthDims;
+            float sx = _backend.ColorWidth  > 0 ? (float)_backend.DepthWidth  / _backend.ColorWidth  : 0f;
+            float sy = _backend.ColorHeight > 0 ? (float)_backend.DepthHeight / _backend.ColorHeight : 0f;
+            int depthIndex = 0;
+
+            foreach (var r in FrameRecords)
+            {
+                var frame = new SfzFrame { TimestampNs = r.TimestampNs };
+                var color = new SfzSample
+                {
+                    TimestampNs = r.TimestampNs, Index = hasRgb ? r.ColorIndex : -1,
+                    Position = r.Position, Rotation = r.Rotation,
+                    HasIntrinsics = r.HasIntrinsics, Fx = r.Fx, Fy = r.Fy, Cx = r.Cx, Cy = r.Cy,
+                };
+                frame.Add(CaptureBackend.ColorSensor, color);
+
+                if (hasDep && r.HasDepth)
+                {
+                    var depth = color;
+                    depth.Index         = depthIndex++;
+                    depth.HasIntrinsics = r.HasIntrinsics && sx > 0f && sy > 0f;
+                    depth.Fx = r.Fx * sx; depth.Fy = r.Fy * sy; depth.Cx = r.Cx * sx; depth.Cy = r.Cy * sy;
+                    frame.Add(CaptureBackend.DepthSensorName, depth);
+                }
+                frames.Add(frame);
+            }
+            return frames;
+        }
+
         // ── Frame callback ─────────────────────────────────────────────────
 
         void OnCameraFrameReceived(ARCameraFrameEventArgs args)
@@ -290,7 +347,6 @@ namespace SensorFlex.Recorder
                 : (long)(Time.realtimeSinceStartup * 1_000_000_000L);
 
             if (_firstTimestampNs == 0) _firstTimestampNs = timestampNs;
-            _lastTimestampNs = timestampNs;
 
             if (_maxDurationNs > 0 && (timestampNs - _firstTimestampNs) >= _maxDurationNs)
             {
@@ -421,22 +477,12 @@ namespace SensorFlex.Recorder
 
         // ── Helpers ────────────────────────────────────────────────────────
 
-        int ComputeActualFps()
+        static int ComputeActualFps(List<SfzFrame> frames)
         {
-            int count = FrameRecords.Count;
+            int count = frames.Count;
             if (count < 2) return 0;
-            double durationSec = (_lastTimestampNs - _firstTimestampNs) / 1_000_000_000.0;
+            double durationSec = (frames[count - 1].TimestampNs - frames[0].TimestampNs) / 1_000_000_000.0;
             return durationSec > 0 ? Mathf.RoundToInt((float)((count - 1) / durationSec)) : 0;
         }
-
-        static string ResolveCaptureFramework() => Application.platform switch
-        {
-            RuntimePlatform.IPhonePlayer  => "ARKit",
-            RuntimePlatform.Android       => "ARCore",
-            RuntimePlatform.OSXEditor
-            or RuntimePlatform.WindowsEditor
-            or RuntimePlatform.LinuxEditor => "ARFoundation Simulation",
-            _                              => "ARFoundation"
-        };
     }
 }

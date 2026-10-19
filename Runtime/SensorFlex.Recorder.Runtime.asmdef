@@ -7,7 +7,8 @@
     "Unity.XR.CoreUtils",
     "Unity.TextMeshPro",
     "UnityEngine.UI",
-    "Unity.InputSystem"
+    "Unity.InputSystem",
+    "Unity.XR.Management"
   ],
   "includePlatforms": [],
   "excludePlatforms": [],

@@ -9,19 +9,14 @@ using ZipArchiveMode      = System.IO.Compression.ZipArchiveMode;
 
 namespace SensorFlex.Recorder
 {
-    // Packages a completed capture temp folder into a single SFZ archive (SFZ v2.0).
+    // Packages a completed capture temp folder into a single SFZ archive (SFZ 2.0, sensor rig).
     //
-    // Expected files in tempDir:
-    //   color.mp4        — H.264/HEVC video (iOS SFRgbEncoder / Android MediaCodec)
-    //   depth.bin        — compressed depth blocks (iOS float32 m, Android uint16 mm)
-    //   depth_sizes.bin  — int32 compressed byte count per frame with depth
-    //   depth.mp4        — video depth (HEVC/H264 codecs) instead of depth.bin
+    // For each sensor in meta.Sensors with a file, tempDir holds that file (color.mp4, depth.bin,
+    // depth_left.bin, …); block depth sensors also have a SizesFile with one int32 per block.
     //
     // Output zip entries (all under "session/"):
-    //   session/session.json   — metadata (Deflate)
-    //   session/frames.jsonl   — per-frame camera+depth records (Deflate)
-    //   session/color.mp4      — video (Stored, already compressed)
-    //   session/depth.bin      — depth blocks (Stored, already compressed)
+    //   session.json, frames.jsonl — Deflate
+    //   sensor files               — Stored (already compressed)
     //
     // The temp folder is deleted after successful packaging.
     internal static class ArchiveFinalizer
@@ -30,9 +25,10 @@ namespace SensorFlex.Recorder
             string tempDir,
             string outputDir,
             SfzSessionMetadata meta,
-            List<SfzFrameRecord> frameRecords)
+            List<SfzFrame> frames,
+            CaptureBackend backend)
         {
-            return Task.Run(() => Finalize(tempDir, outputDir, meta, frameRecords));
+            return Task.Run(() => Finalize(tempDir, outputDir, meta, frames, backend));
         }
 
         // ── Core (background thread) ───────────────────────────────────────
@@ -41,29 +37,26 @@ namespace SensorFlex.Recorder
             string tempDir,
             string outputDir,
             SfzSessionMetadata meta,
-            List<SfzFrameRecord> frameRecords)
+            List<SfzFrame> frames,
+            CaptureBackend backend)
         {
-            // Wait for native encoders to flush (RGB HEVC + depth LZ4 queue drain).
-            NativeVideoEncoder.WaitForBothFinished(timeoutMs: 60_000);
+            // Wait for the backend's encoders to flush (video encoders + depth queues).
+            backend.WaitForFinish(timeoutMs: 60_000);
 
             if (!Directory.Exists(tempDir))
                 throw new DirectoryNotFoundException($"[SF-Recorder] Temp dir not found: {tempDir}");
 
             Directory.CreateDirectory(outputDir);
 
-            bool isVideoDepth = meta.DepthCodec == SfzDepthCodec.HEVC || meta.DepthCodec == SfzDepthCodec.H264;
-
-            // ── Read depth compressed sizes (LZ4 only) ─────────────────────
-            int[] depthSizes = null;
-            if (!isVideoDepth)
-            {
-                string depthSizesPath = Path.Combine(tempDir, "depth_sizes.bin");
-                depthSizes = ReadDepthSizes(depthSizesPath, frameRecords.Count);
-            }
+            // ── Block sizes per block-depth sensor ─────────────────────────
+            var blockSizes = new Dictionary<string, int[]>();
+            foreach (var sensor in meta.Sensors)
+                if (!string.IsNullOrEmpty(sensor.SizesFile))
+                    blockSizes[sensor.Name] = ReadBlockSizes(sensor.SizesFile);
 
             // ── Build text files ───────────────────────────────────────────
             byte[] sessionJsonBytes = SfzSerializer.BuildSessionJson(meta);
-            byte[] framesJsonlBytes = SfzSerializer.BuildFramesJsonl(meta, frameRecords, depthSizes);
+            byte[] framesJsonlBytes = SfzSerializer.BuildFramesJsonl(frames, blockSizes);
 
             // ── Write SFZ archive ──────────────────────────────────────────
             string outPath = Path.Combine(outputDir, meta.SessionId + ".sfz");
@@ -74,16 +67,14 @@ namespace SensorFlex.Recorder
             {
                 WriteBytes(archive, "session/session.json", sessionJsonBytes, SysCompressionLevel.Optimal);
                 WriteBytes(archive, "session/frames.jsonl", framesJsonlBytes, SysCompressionLevel.Optimal);
-                CopyFile(archive, "session/" + CaptureBackend.ColorFileName,
-                         Path.Combine(tempDir, CaptureBackend.ColorFileName), SysCompressionLevel.NoCompression);
-                if (isVideoDepth)
-                    CopyFile(archive, "session/depth.mp4", Path.Combine(tempDir, "depth.mp4"), SysCompressionLevel.NoCompression);
-                else
-                    CopyFile(archive, "session/depth.bin", Path.Combine(tempDir, "depth.bin"), SysCompressionLevel.NoCompression);
+                foreach (var sensor in meta.Sensors)
+                    if (!string.IsNullOrEmpty(sensor.File))
+                        CopyFile(archive, "session/" + sensor.File, Path.Combine(tempDir, sensor.File),
+                                 SysCompressionLevel.NoCompression);
             }
 
             long kb = new FileInfo(outPath).Length / 1024;
-            Debug.Log($"[SF-Recorder] SFZ written: {outPath} ({kb} KB) frames={frameRecords.Count}");
+            Debug.Log($"[SF-Recorder] SFZ written: {outPath} ({kb} KB) frames={frames.Count} sensors={meta.Sensors.Count}");
 
             TryDeleteDir(tempDir);
             return new[] { outPath };
@@ -91,17 +82,15 @@ namespace SensorFlex.Recorder
 
         // ── Helpers ────────────────────────────────────────────────────────
 
-        // depth_sizes.bin is a flat array of int32 (little-endian), one per frame that
-        // reported HasDepth. If the file doesn't exist (depth not recorded), returns empty.
-        static int[] ReadDepthSizes(string path, int frameCount)
+        // A sizes file is a flat array of int32 (little-endian), one per written block.
+        static int[] ReadBlockSizes(string path)
         {
             if (!File.Exists(path)) return Array.Empty<int>();
 
             using var fs = File.OpenRead(path);
             using var br = new BinaryReader(fs);
-            int count = (int)Math.Min(frameCount, fs.Length / 4);
-            var sizes = new int[count];
-            for (int i = 0; i < count; i++)
+            var sizes = new int[fs.Length / 4];
+            for (int i = 0; i < sizes.Length; i++)
                 sizes[i] = br.ReadInt32();
 
             return sizes;

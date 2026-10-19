@@ -128,6 +128,9 @@ namespace SensorFlex.Recorder
 
         void Update()
         {
+            // Frame-driving backends (Android XR) produce frames from the update loop.
+            if (IsRecording) _coordinator?.Tick();
+
             // Drive standby coordinator state machine.
             if (_standbyCoordinator != null && !IsStandby && !IsRecording)
             {
@@ -299,12 +302,13 @@ namespace SensorFlex.Recorder
 
             string tempDir  = _coordinator.TempDir;
             var    meta     = _coordinator.SessionMetadata;
-            var    records  = _coordinator.FrameRecords;
+            var    frames   = _coordinator.Frames;
+            var    backend  = _coordinator.Backend;
 
             _coordinator.Dispose();
             _coordinator = null;
 
-            if (records.Count == 0)
+            if (frames.Count == 0)
             {
                 Debug.LogWarning("[SF-Recorder] Recording stopped with zero frames. No archive will be created.");
                 return;
@@ -315,8 +319,8 @@ namespace SensorFlex.Recorder
                 : Path.Combine(Application.persistentDataPath, m_OutputDirectory);
 
             IsFinalizing      = true;
-            _finalizationTask = ArchiveFinalizer.FinalizeAsync(tempDir, outputDir, meta, records);
-            Debug.Log($"[SF-Recorder] Recording stopped ({records.Count} frames). Finalizing archive...");
+            _finalizationTask = ArchiveFinalizer.FinalizeAsync(tempDir, outputDir, meta, frames, backend);
+            Debug.Log($"[SF-Recorder] Recording stopped ({frames.Count} frames). Finalizing archive...");
         }
     }
 }
