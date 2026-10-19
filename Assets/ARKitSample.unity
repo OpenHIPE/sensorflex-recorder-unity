@@ -310,14 +310,16 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 27739f692bba4af49622cbf019c39998, type: 3}
   m_Name: 
   m_EditorClassIdentifier: SensorFlex.Recorder.Runtime::SensorFlex.Recorder.ARSensorFlexRecorder
-  m_TargetFPS: 30
   m_SessionId: 
   m_CaptureColor: 1
   m_CaptureDepth: 1
   m_CapturePose: 1
   m_CaptureIntrinsics: 1
   m_OutputDirectory: SensorFlexRecordings
-  m_MaxPartSizeMb: 500
+  m_MaxRecordingSeconds: 60
+  m_RgbCodec: 1
+  m_DepthCodec: 0
+  m_DepthMaxMeters: 10
   m_RecordOnStart: 0
 --- !u!114 &321457617
 MonoBehaviour:
