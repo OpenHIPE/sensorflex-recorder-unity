@@ -12,7 +12,7 @@ namespace SensorFlex.Recorder
     // Packages a completed capture temp folder into a single SFZ archive (SFZ v2.0).
     //
     // Expected files in tempDir:
-    //   rgb.mp4          — H.264/HEVC video (iOS SFRgbEncoder / Android MediaCodec)
+    //   color.mp4        — H.264/HEVC video (iOS SFRgbEncoder / Android MediaCodec)
     //   depth.bin        — compressed depth blocks (iOS float32 m, Android uint16 mm)
     //   depth_sizes.bin  — int32 compressed byte count per frame with depth
     //   depth.mp4        — video depth (HEVC/H264 codecs) instead of depth.bin
@@ -20,7 +20,7 @@ namespace SensorFlex.Recorder
     // Output zip entries (all under "session/"):
     //   session/session.json   — metadata (Deflate)
     //   session/frames.jsonl   — per-frame camera+depth records (Deflate)
-    //   session/rgb.mp4        — video (Stored, already compressed)
+    //   session/color.mp4      — video (Stored, already compressed)
     //   session/depth.bin      — depth blocks (Stored, already compressed)
     //
     // The temp folder is deleted after successful packaging.
@@ -63,7 +63,7 @@ namespace SensorFlex.Recorder
 
             // ── Build text files ───────────────────────────────────────────
             byte[] sessionJsonBytes = SfzSerializer.BuildSessionJson(meta);
-            byte[] framesJsonlBytes = SfzSerializer.BuildFramesJsonl(frameRecords, depthSizes, meta.DepthCodec);
+            byte[] framesJsonlBytes = SfzSerializer.BuildFramesJsonl(meta, frameRecords, depthSizes);
 
             // ── Write SFZ archive ──────────────────────────────────────────
             string outPath = Path.Combine(outputDir, meta.SessionId + ".sfz");
@@ -74,7 +74,8 @@ namespace SensorFlex.Recorder
             {
                 WriteBytes(archive, "session/session.json", sessionJsonBytes, SysCompressionLevel.Optimal);
                 WriteBytes(archive, "session/frames.jsonl", framesJsonlBytes, SysCompressionLevel.Optimal);
-                CopyFile(archive, "session/rgb.mp4", Path.Combine(tempDir, "rgb.mp4"), SysCompressionLevel.NoCompression);
+                CopyFile(archive, "session/" + CaptureBackend.ColorFileName,
+                         Path.Combine(tempDir, CaptureBackend.ColorFileName), SysCompressionLevel.NoCompression);
                 if (isVideoDepth)
                     CopyFile(archive, "session/depth.mp4", Path.Combine(tempDir, "depth.mp4"), SysCompressionLevel.NoCompression);
                 else

@@ -17,6 +17,8 @@ namespace SensorFlex.Recorder
     //             Encode* per frame → Finish
     internal abstract class CaptureBackend
     {
+        public const string ColorFileName = "color.mp4";
+
         protected readonly ARSensorFlexRecorder Config;
         protected readonly string RgbMp4Path;
         protected readonly string DepthBinPath;
@@ -26,7 +28,7 @@ namespace SensorFlex.Recorder
         protected CaptureBackend(ARSensorFlexRecorder config, string tempDir)
         {
             Config         = config;
-            RgbMp4Path     = Path.Combine(tempDir, "rgb.mp4");
+            RgbMp4Path     = Path.Combine(tempDir, ColorFileName);
             DepthBinPath   = Path.Combine(tempDir, "depth.bin");
             DepthSizesPath = Path.Combine(tempDir, "depth_sizes.bin");
             DepthMp4Path   = Path.Combine(tempDir, "depth.mp4");

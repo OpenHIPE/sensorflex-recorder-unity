@@ -27,7 +27,7 @@ SFZ 2.0 archive after recording stops. The archive format is specified in
                                        │ standby / start / stop
 ┌─ CaptureCoordinator ────────────────────────────────────────────────────────┐
 │ lifecycle · pose · intrinsics · duration limit · session metadata           │
-│ FrameRecords: rgb_frame = index in rgb.mp4, -1 if color was dropped         │
+│ FrameRecords: color index in color.mp4, -1 if the image was dropped         │
 │ CaptureBackend per platform (Editor: NullCaptureBackend, pose only)         │
 └─────────────────┬───────────────────────────────────────┬───────────────────┘
                   ▼                                       ▼
@@ -51,10 +51,10 @@ SFZ 2.0 archive after recording stops. The archive format is specified in
 └─────────────────┬─────────────────┘ └───────────────────┬───────────────────┘
                   └───────────────────┬───────────────────┘
                                       ▼
-         TempDir: rgb.mp4 · depth.bin + depth_sizes.bin | depth.mp4
+        TempDir: color.mp4 · depth.bin + depth_sizes.bin | depth.mp4
                                       ▼
              ArchiveFinalizer → <session_id>.sfz (SFZ v2.0 zip)
-     session.json · frames.jsonl · rgb.mp4 · depth.bin | depth.mp4
+    session.json · frames.jsonl · color.mp4 · depth.bin | depth.mp4
 ```
 
 ## Recording Flow
@@ -72,14 +72,15 @@ Each AR frame (main thread)
   ├─ backend.EncodeColor(relativeNs)     → true if handed to the encoder
   ├─ backend.EncodeDepth(relativeNs)     → true if queued
   ├─ pose (Camera.transform), intrinsics (native › FOV estimate, cached)
-  └─ FrameRecords.Add(... rgb_frame = next index or -1 ...)
+  └─ FrameRecords.Add(... ColorIndex = next index or -1 ...)
 
 StopRecording (or max duration)
   ├─ backend.Finish()                    seal encoders (async)
   └─ ArchiveFinalizer.FinalizeAsync      background Task
         ├─ NativeVideoEncoder.WaitForBothFinished(60 s)
-        ├─ session.json + frames.jsonl (depth_sizes.bin → depth_off / depth_sz)
-        ├─ <session_id>.sfz: json DEFLATE, rgb.mp4 / depth.* STORED
+        ├─ session.json (sensors: color, depth) + frames.jsonl (per-sensor blocks;
+        │    depth_sizes.bin → depth off / sz)
+        ├─ <session_id>.sfz: json DEFLATE, color.mp4 / depth.* STORED
         └─ delete temp folder
 ```
 
@@ -88,7 +89,7 @@ StopRecording (or max duration)
 | Module | Role |
 |---|---|
 | `ARSensorFlexRecorder` | Scene-facing MonoBehaviour on `XROrigin`: settings, standby state machine, start/stop, events. |
-| `CaptureCoordinator` | Per-session lifecycle, pose, intrinsics, `FrameRecords` (incl. `rgb_frame`), duration limit, session metadata. No platform code. |
+| `CaptureCoordinator` | Per-session lifecycle, pose, intrinsics, `FrameRecords` (incl. color index), duration limit, session metadata. No platform code. |
 | `CaptureBackend` | Platform half of capture: `IosCaptureBackend`, `AndroidCaptureBackend`, `NullCaptureBackend` (Editor). Owns XRCpuImage layouts and encoder calls; reports `depth.encoding` / `units`. |
 | `NativeVideoEncoder` | Static bridge: P/Invoke into `SFVideoEncoder.mm` (iOS), JNI slot rings + C# LZ4 worker (Android), stubs elsewhere. |
 | `SFVideoEncoder.mm` | iOS: AVAssetWriter H.264/HEVC for color; `compression_encode_buffer` LZ4/Zstd or VideoToolbox video for depth. |
@@ -113,7 +114,7 @@ from `Camera.transform`.
 
 ## Temp Folder
 
-`Application.temporaryCachePath/SF-Recorder/{sessionId}/` holds `rgb.mp4`, `depth.bin` +
+`Application.temporaryCachePath/SF-Recorder/{sessionId}/` holds `color.mp4`, `depth.bin` +
 `depth_sizes.bin` (or `depth.mp4`) while recording; it is deleted after finalization.
 
 ## Scene Setup

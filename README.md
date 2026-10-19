@@ -13,11 +13,17 @@ intrinsics) and packages them as SFZ v2.0 archives that the SensorFlex Player ca
 
 See [Docs/Architecture.md](Docs/Architecture.md) for the capture pipeline diagram (ARKit and ARCore paths).
 
-## Depth encodings in `session.json`
+## What a recording contains
 
-`depth.encoding` says how to decode the bytes; `depth.units` says what a decoded value means.
+Archives follow the SFZ 2.0 spec (`com.sensorflex.player.unity/Docs/SensorFlexFormat.md`). The
+recorder writes a handheld rig with two sensors:
 
-| Platform | `DepthCodec` | `encoding` | `units` | File |
+- `color` — `color.mp4`; it is the `frame_source`. Its block in each `frames.jsonl` line holds the
+  camera pose and intrinsics, and `index` = the frame in `color.mp4` (`-1` if the encoder dropped it).
+- `depth` — captured from the color camera's viewpoint, so its block repeats the color pose and
+  timestamp, with intrinsics scaled to the depth resolution. Omitted on frames without depth.
+
+| Platform | `DepthCodec` | depth `encoding` | `units` | File |
 |---|---|---|---|---|
 | iOS | LZ4 (default) | `lz4_float32` | `meters` | `depth.bin` |
 | iOS | Zstd | `zstd_float32` | `meters` | `depth.bin` |
@@ -27,17 +33,8 @@ See [Docs/Architecture.md](Docs/Architecture.md) for the capture pipeline diagra
 | Android | HEVC | `hevc_uint8_norm` | `meters` (× `depth_max_meters` / 255) | `depth.mp4` |
 
 Android stores ARCore depth at native precision (uint16 mm). Zstd is not available on
-Android; it records as LZ4. A value of `0` means no depth on both platforms.
-
-For `depth.bin`, each frame is one independent compressed block; `frames.jsonl` gives its
-`depth_off` / `depth_sz` byte range. Video depth uses a running `depth_frame` index instead.
-
-## Frame alignment
-
-Each `frames.jsonl` line carries `rgb_frame`: that record's frame index in `rgb.mp4`, or `-1`
-if its color frame was dropped (encoder busy). Readers must map video frames to records
-through `rgb_frame` rather than assuming video frame N is record N. Archives written before
-this field existed have no `rgb_frame`; treat them as 1:1.
+Android; it records as LZ4. A value of `0` means no depth on both platforms. For `depth.bin`,
+each sample is one independent compressed block at the depth block's `off` / `sz`.
 
 ## Layout
 

@@ -46,7 +46,7 @@ namespace SensorFlex.Recorder
         Camera            _mainCamera;
 
         int   _frameIndex;
-        int   _rgbFrameIndex;  // next video frame index in rgb.mp4
+        int   _colorIndex;     // next frame index in color.mp4
         bool  _isCapturing;
         bool  _captureDepthEnabled;
 
@@ -133,7 +133,7 @@ namespace SensorFlex.Recorder
             if (_isCapturing) return;
 
             _frameIndex              = 0;
-            _rgbFrameIndex           = 0;
+            _colorIndex              = 0;
             _hasValidIntrinsics      = false;
             _warnedDropped           = false;
             _warnedMissingIntrinsics = false;
@@ -212,7 +212,7 @@ namespace SensorFlex.Recorder
             _backend.ResetForCapture(keepDims: false);
 
             _frameIndex              = 0;
-            _rgbFrameIndex           = 0;
+            _colorIndex              = 0;
             _hasValidIntrinsics      = false;
             _warnedDropped           = false;
             _warnedMissingIntrinsics = false;
@@ -354,7 +354,7 @@ namespace SensorFlex.Recorder
                 HasIntrinsics = hasIntrinsics,
                 Fx = fx, Fy = fy, Cx = cx, Cy = cy,
                 HasColor = hasColor,
-                RgbFrame = hasColor ? _rgbFrameIndex++ : -1,
+                ColorIndex = hasColor ? _colorIndex++ : -1,
                 HasDepth = hasDepth,
             });
 
