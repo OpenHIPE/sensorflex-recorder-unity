@@ -10,6 +10,9 @@ namespace SensorFlex.Recorder
         const int HashSize = 1 << HashLog;
         const int MaxDist  = 65535;
         const int MflLimit = 12;
+        // LZ4 block format: the last 5 bytes must be literals. Matches that run into them
+        // decode with lenient decoders but are rejected by the reference decoder (LZ4_decompress_safe).
+        const int LastLiterals = 5;
 
         // Returns bytes written to dst, or -1 if dst too small.
         public static int Encode(byte[] src, int srcOff, int srcLen,
@@ -45,7 +48,7 @@ namespace SensorFlex.Recorder
                         src[matchPos + 3] == src[sPos + 3])
                     {
                         int mLen = 4;
-                        int sMax = Math.Min(sEnd - sPos, MaxDist);
+                        int sMax = Math.Min(sEnd - LastLiterals - sPos, MaxDist);
                         while (mLen < sMax && src[matchPos + mLen] == src[sPos + mLen]) mLen++;
 
                         int litLen = sPos - anchor;

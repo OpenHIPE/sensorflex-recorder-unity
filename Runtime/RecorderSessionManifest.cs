@@ -13,6 +13,7 @@ namespace SensorFlex.Recorder
         public bool       HasIntrinsics;
         public float      Fx, Fy, Cx, Cy;
         public bool       HasColor;
+        public int        RgbFrame;      // index into rgb.mp4, or -1 if color was dropped
         public bool       HasDepth;
     }
 

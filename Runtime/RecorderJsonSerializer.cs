@@ -16,7 +16,10 @@ namespace SensorFlex.Recorder
     //
     // frames.jsonl — one compact JSON line per frame:
     //   {"frame":0,"ts":1234567890,"pos":[x,y,z],"rot":[x,y,z,w],
-    //    "fx":1500,"fy":1500,"cx":960,"cy":720,"depth_off":0,"depth_sz":12345}
+    //    "fx":1500,"fy":1500,"cx":960,"cy":720,"depth_off":0,"depth_sz":12345,"rgb_frame":0}
+    //
+    // rgb_frame is the record's frame index in rgb.mp4, or -1 if its color frame was
+    // dropped. Readers must map video frames to records through it (not assume equality).
     //
     // depth_off / depth_sz are byte offsets/sizes into depth.bin.
     // If a frame has no depth, depth_sz == 0 and depth_off points past the last byte.
@@ -124,6 +127,8 @@ namespace SensorFlex.Recorder
                     sb.Append(",\"cx\":").Append(F(f.Cx));
                     sb.Append(",\"cy\":").Append(F(f.Cy));
                 }
+
+                sb.Append(",\"rgb_frame\":").Append(f.RgbFrame);
 
                 if (isVideoDepth)
                 {

@@ -122,8 +122,12 @@ namespace SensorFlex.Recorder
                 _targetColorW = chosen.width;
                 _targetColorH = chosen.height;
 
+                // Compare by what matters; struct equality also compares native handles,
+                // which differ between enumerations of the same configuration.
                 var current = cameraManager.currentConfiguration;
-                if (current.HasValue && current.Value == chosen) return false;
+                if (current.HasValue && current.Value.width == chosen.width &&
+                    current.Value.height == chosen.height && current.Value.framerate == chosen.framerate)
+                    return false;
 
                 cameraManager.currentConfiguration = chosen;
                 Debug.Log($"[SF-Recorder] ARCore camera config → {chosen.width}x{chosen.height} @ {chosen.framerate} fps");

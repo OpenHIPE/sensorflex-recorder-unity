@@ -45,6 +45,12 @@ public class SFVideoEncoderAndroid {
     private ArrayBlockingQueue<Integer>  mFreeSlots;
     private byte[]                       mRowTmp;
 
+    // -1 = not yet probed, 0 = generic per-pixel chroma write, 1 = NV12 (V plane aliases U+1)
+    private int  mChromaLayout = -1;
+    private long mEncodeNanos;
+    private int  mEncodeCount;
+    private int  mInternalDrops;   // accepted by submitSlot but never encoded (breaks rgb_frame indices)
+
     // codec: 0=H264, 1=HEVC  |  isDepth: depth uses low bit-rate
     public boolean start(String outputPath, int width, int height, int codec, boolean isDepth, int slotCount) {
         mOutputPath = outputPath;
@@ -109,6 +115,7 @@ public class SFVideoEncoderAndroid {
                 encodeFrame(mSlots[slot], timestampUs);
                 drainEncoder(false);
             } catch (Exception e) {
+                mInternalDrops++;
                 Log.e(TAG, "[SF] Encode failed: " + e.getMessage());
             } finally {
                 mFreeSlots.offer(slot);
@@ -161,13 +168,27 @@ public class SFVideoEncoderAndroid {
         return -1;
     }
 
+    // A frame accepted by submitSlot() must reach the codec, or rgb_frame indices in
+    // frames.jsonl drift. Keep waiting while recording; a stalled codec backs up the slot
+    // ring instead, and C# drops (and records) the frames it cannot submit.
     private void encodeFrame(ByteBuffer src, long timestampUs) {
         int idx = dequeueInput();
-        if (idx < 0) { Log.w(TAG, "[SF] Input buffer unavailable, frame dropped"); return; }
+        while (idx < 0 && !mFinishing) {
+            Log.w(TAG, "[SF] Encoder input stalled > 1 s, still waiting");
+            idx = dequeueInput();
+        }
+        if (idx < 0) {
+            mInternalDrops++;
+            Log.e(TAG, "[SF] Input buffer unavailable at finish, frame dropped");
+            return;
+        }
 
         Image image = mEncoder.getInputImage(idx);
         if (image != null) {
+            long t0 = System.nanoTime();
             writeNv12(src, image);
+            mEncodeNanos += System.nanoTime() - t0;
+            mEncodeCount++;
         } else {
             // Non-flexible codec: assume semi-planar NV12 with tight rows.
             ByteBuffer in = mEncoder.getInputBuffer(idx);
@@ -208,6 +229,26 @@ public class SFVideoEncoderAndroid {
         int chromaW = mWidth / 2, chromaH = mHeight / 2;
         int uvBase  = mWidth * mHeight;
         s.limit(mFrameBytes);
+
+        if (mChromaLayout < 0)
+            mChromaLayout = isNv12Layout(uDst, vDst, uPixStride, vPixStride, uRowStride, vRowStride) ? 1 : 0;
+
+        if (mChromaLayout == 1) {
+            // Codec memory is already NV12 (U,V interleaved, V = U + 1): copy whole rows.
+            // The U plane's buffer ends one byte before the last V sample.
+            int uCap = uDst.capacity();
+            for (int row = 0; row < chromaH; row++) {
+                int dstPos = row * uRowStride;
+                int n = Math.min(mWidth, uCap - dstPos);
+                s.limit(uvBase + row * mWidth + n).position(uvBase + row * mWidth);
+                uDst.position(dstPos);
+                uDst.put(s);
+                if (n < mWidth)   // last V sample of the plane
+                    vDst.put(row * vRowStride + (chromaW - 1) * 2, src.get(uvBase + row * mWidth + mWidth - 1));
+            }
+            return;
+        }
+
         for (int row = 0; row < chromaH; row++) {
             s.position(uvBase + row * mWidth);
             s.get(mRowTmp, 0, mWidth);
@@ -217,6 +258,21 @@ public class SFVideoEncoderAndroid {
                 vDst.put(vRow + col * vPixStride, mRowTmp[col * 2 + 1]);
             }
         }
+    }
+
+    // True when the U and V planes are views of one interleaved NV12 buffer (V = U + 1).
+    // Probed once by writing through U and reading back through V.
+    private static boolean isNv12Layout(ByteBuffer u, ByteBuffer v, int uPix, int vPix, int uRow, int vRow) {
+        if (uPix != 2 || vPix != 2 || uRow != vRow || u.capacity() < 2 || v.capacity() < 1) return false;
+        byte savedU1 = u.get(1);
+        byte savedV0 = v.get(0);
+        byte probe   = (byte) (savedV0 ^ 0x5A);
+        u.put(1, probe);
+        boolean aliased = v.get(0) == probe;
+        u.put(1, savedU1);
+        v.put(0, savedV0);
+        Log.d(TAG, "[SF] Encoder chroma layout: " + (aliased ? "NV12 (row copy)" : "generic (per-pixel)"));
+        return aliased;
     }
 
     private void drainEncoder(boolean eos) {
@@ -265,7 +321,11 @@ public class SFVideoEncoderAndroid {
             Log.w(TAG, "[SF] No frames encoded; removing " + mOutputPath);
             new File(mOutputPath).delete();
         }
-        Log.d(TAG, "[SF] Encoder finished, frames=" + mFramesWritten);
+        if (mInternalDrops > 0)
+            Log.e(TAG, "[SF] " + mInternalDrops + " accepted frames were not encoded; rgb_frame indices may be off");
+        Log.d(TAG, "[SF] Encoder finished, frames=" + mFramesWritten
+                + (mEncodeCount > 0
+                   ? String.format(" avgInputCopyMs=%.2f", mEncodeNanos / 1e6 / mEncodeCount) : ""));
         return ok;
     }
 

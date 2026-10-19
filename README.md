@@ -42,7 +42,7 @@ intrinsics) and packages them as SFZ v2.0 archives that the SensorFlex Player ca
         │               │                          ▼ slot             │
         │               │              ┌────────────────────────┐     │
         │               │              │ Direct ByteBuffer ring │     │
-        │               │              │ [0][1][2][3]           │     │
+        │               │              │ [0][1] … [7]  8 slots  │     │
         │               │              │ full → drop + warn     │     │
         │               │              └───────────┬────────────┘     │
         │               │                          │ appendFrame      │
@@ -90,6 +90,13 @@ Android; it records as LZ4. A value of `0` means no depth on both platforms.
 
 For `depth.bin`, each frame is one independent compressed block; `frames.jsonl` gives its
 `depth_off` / `depth_sz` byte range. Video depth uses a running `depth_frame` index instead.
+
+## Frame alignment
+
+Each `frames.jsonl` line carries `rgb_frame`: that record's frame index in `rgb.mp4`, or `-1`
+if its color frame was dropped (encoder busy). Readers must map video frames to records
+through `rgb_frame` rather than assuming video frame N is record N. Archives written before
+this field existed have no `rgb_frame`; treat them as 1:1.
 
 ## Layout
 

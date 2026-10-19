@@ -46,6 +46,7 @@ namespace SensorFlex.Recorder
         Camera            _mainCamera;
 
         int   _frameIndex;
+        int   _rgbFrameIndex;  // next video frame index in rgb.mp4
         bool  _isCapturing;
         bool  _captureDepthEnabled;
 
@@ -100,6 +101,11 @@ namespace SensorFlex.Recorder
                 _captureDepthEnabled = false;
             _backend.Configure(_config.CaptureColor, _captureDepthEnabled);
 
+            // Switch depth to the recording mode now, not at Begin(): changing it restarts
+            // the provider's depth pipeline (ARCore: ~2.5 s with no depth).
+            if (_captureDepthEnabled && !_standbySubscribed)
+                ConfigureDepthMode();
+
             Directory.CreateDirectory(TempDir);
             if (!_standbySubscribed)
             {
@@ -127,6 +133,7 @@ namespace SensorFlex.Recorder
             if (_isCapturing) return;
 
             _frameIndex              = 0;
+            _rgbFrameIndex           = 0;
             _hasValidIntrinsics      = false;
             _warnedDropped           = false;
             _warnedMissingIntrinsics = false;
@@ -205,6 +212,7 @@ namespace SensorFlex.Recorder
             _backend.ResetForCapture(keepDims: false);
 
             _frameIndex              = 0;
+            _rgbFrameIndex           = 0;
             _hasValidIntrinsics      = false;
             _warnedDropped           = false;
             _warnedMissingIntrinsics = false;
@@ -346,6 +354,7 @@ namespace SensorFlex.Recorder
                 HasIntrinsics = hasIntrinsics,
                 Fx = fx, Fy = fy, Cx = cx, Cy = cy,
                 HasColor = hasColor,
+                RgbFrame = hasColor ? _rgbFrameIndex++ : -1,
                 HasDepth = hasDepth,
             });
 

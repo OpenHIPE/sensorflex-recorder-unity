@@ -162,7 +162,7 @@ namespace SensorFlex.Recorder
         // JNI. When every slot is in flight, AcquireSlot returns -1 and the caller drops
         // the frame (bounded memory).
 
-        const int SlotCount = 4;
+        const int SlotCount = 8;
 
         sealed class SlotEncoder
         {
