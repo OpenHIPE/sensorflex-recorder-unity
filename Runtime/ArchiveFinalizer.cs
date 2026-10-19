@@ -12,9 +12,10 @@ namespace SensorFlex.Recorder
     // Packages a completed capture temp folder into a single SFZ archive (SFZ v2.0).
     //
     // Expected files in tempDir:
-    //   rgb.mp4          — HEVC YCbCr420 video (from SFRgbEncoder)
-    //   depth.bin        — LZ4_RAW float32 depth blocks (from SFDepthLz4)
-    //   depth_sizes.bin  — int32 per-frame compressed byte counts (from SFDepthLz4)
+    //   rgb.mp4          — H.264/HEVC video (iOS SFRgbEncoder / Android MediaCodec)
+    //   depth.bin        — compressed depth blocks (iOS float32 m, Android uint16 mm)
+    //   depth_sizes.bin  — int32 compressed byte count per frame with depth
+    //   depth.mp4        — video depth (HEVC/H264 codecs) instead of depth.bin
     //
     // Output zip entries (all under "session/"):
     //   session/session.json   — metadata (Deflate)
@@ -89,16 +90,17 @@ namespace SensorFlex.Recorder
 
         // ── Helpers ────────────────────────────────────────────────────────
 
-        // depth_sizes.bin is a flat array of int32 (little-endian), one per frame.
-        // If the file doesn't exist (depth not recorded), returns an array of zeros.
+        // depth_sizes.bin is a flat array of int32 (little-endian), one per frame that
+        // reported HasDepth. If the file doesn't exist (depth not recorded), returns empty.
         static int[] ReadDepthSizes(string path, int frameCount)
         {
-            var sizes = new int[frameCount];
-            if (!File.Exists(path)) return sizes;
+            if (!File.Exists(path)) return Array.Empty<int>();
 
             using var fs = File.OpenRead(path);
             using var br = new BinaryReader(fs);
-            for (int i = 0; i < frameCount && fs.Position + 4 <= fs.Length; i++)
+            int count = (int)Math.Min(frameCount, fs.Length / 4);
+            var sizes = new int[count];
+            for (int i = 0; i < count; i++)
                 sizes[i] = br.ReadInt32();
 
             return sizes;

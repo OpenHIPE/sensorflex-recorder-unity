@@ -10,8 +10,9 @@ namespace SensorFlex.Recorder
     //   { "sfz_version":"2.0", "session_id":"...", "start_time_utc":"...", "device":{...},
     //     "actual_fps":57, "frame_count":998,
     //     "rgb":{"width":W,"height":H,"encoding":"hevc_mp4","file":"rgb.mp4"},
-    //     "depth":{"width":W,"height":H,"encoding":"lz4_raw_float32","file":"depth.bin",
+    //     "depth":{"width":W,"height":H,"encoding":"lz4_float32","file":"depth.bin",
     //              "units":"meters","sensor":"arkit_lidar"} }
+    //   (Android LZ4 depth: "encoding":"lz4_uint16", "units":"millimeters")
     //
     // frames.jsonl — one compact JSON line per frame:
     //   {"frame":0,"ts":1234567890,"pos":[x,y,z],"rot":[x,y,z,w],
@@ -19,6 +20,8 @@ namespace SensorFlex.Recorder
     //
     // depth_off / depth_sz are byte offsets/sizes into depth.bin.
     // If a frame has no depth, depth_sz == 0 and depth_off points past the last byte.
+    // depth_sizes.bin holds one entry per frame with HasDepth == true (in order), so
+    // frames without depth do not consume an entry.
     internal static class SfzSerializer
     {
         // ── session.json ──────────────────────────────────────────────────────
@@ -55,34 +58,10 @@ namespace SensorFlex.Recorder
 
             if (meta.HasDepth)
             {
-                string depthEncoding;
-                string depthFile;
-                bool   emitDepthMax = false;
-                switch (meta.DepthCodec)
-                {
-                    case SfzDepthCodec.HEVC:
-#if UNITY_IOS
-                        depthEncoding = "hevc_float16";
-#else
-                        depthEncoding = "hevc_uint8_norm";
-                        emitDepthMax  = true;
-#endif
-                        depthFile = "depth.mp4";
-                        break;
-                    case SfzDepthCodec.H264:
-                        depthEncoding = "h264_uint8_norm";
-                        depthFile     = "depth.mp4";
-                        emitDepthMax  = true;
-                        break;
-                    case SfzDepthCodec.Zstd:
-                        depthEncoding = "zstd_float32";
-                        depthFile     = "depth.bin";
-                        break;
-                    default: // LZ4
-                        depthEncoding = "lz4_float32";
-                        depthFile     = "depth.bin";
-                        break;
-                }
+                string depthEncoding = meta.DepthEncoding ?? "lz4_float32";
+                bool   isVideoDepth  = meta.DepthCodec == SfzDepthCodec.HEVC || meta.DepthCodec == SfzDepthCodec.H264;
+                string depthFile     = isVideoDepth ? "depth.mp4" : "depth.bin";
+                bool   emitDepthMax  = depthEncoding.EndsWith("_uint8_norm");
 
                 sb.Append("  \"depth\": {\n");
                 AppendInt(sb, "width",    meta.DepthWidth,  2, true);
@@ -91,7 +70,7 @@ namespace SensorFlex.Recorder
                 AppendStr(sb, "file",     depthFile,        2, true);
                 if (emitDepthMax)
                     AppendFloat(sb, "depth_max_meters", meta.DepthMaxMeters, 2, true);
-                AppendStr(sb, "units",  "meters", 2, true);
+                AppendStr(sb, "units",  meta.DepthUnits ?? "meters", 2, true);
                 AppendStr(sb, "sensor",
                     meta.DepthSensor ?? "arcore_environment_depth", 2, false);
                 sb.Append("  }\n");
@@ -103,22 +82,24 @@ namespace SensorFlex.Recorder
 
         // ── frames.jsonl ──────────────────────────────────────────────────────
 
-        // depthSizes[i] is the LZ4-compressed byte count for frame i (0 if no depth).
-        // For video depth codecs (HEVC/H264), depthSizes is null and a running
-        // depth_frame counter is emitted instead of depth_off/depth_sz.
+        // depthSizes holds the compressed byte count of each depth block, one per frame
+        // with HasDepth (LZ4/Zstd only). For video depth codecs (HEVC/H264), depthSizes
+        // is null and a running depth_frame counter is emitted instead of depth_off/depth_sz.
         public static byte[] BuildFramesJsonl(List<SfzFrameRecord> frames, int[] depthSizes,
                                                SfzDepthCodec depthCodec)
         {
-            bool isVideoDepth = depthCodec != SfzDepthCodec.LZ4;
+            bool isVideoDepth = depthCodec == SfzDepthCodec.HEVC || depthCodec == SfzDepthCodec.H264;
             var sb = new StringBuilder(frames.Count * 140);
             long depthOffset  = 0L;
             int  depthFrameN  = 0;
+            int  depthBlockN  = 0;
 
             for (int i = 0; i < frames.Count; i++)
             {
                 var f   = frames[i];
-                int dsz = (!isVideoDepth && depthSizes != null && i < depthSizes.Length)
-                    ? depthSizes[i] : 0;
+                int dsz = 0;
+                if (!isVideoDepth && f.HasDepth && depthSizes != null && depthBlockN < depthSizes.Length)
+                    dsz = depthSizes[depthBlockN++];
 
                 sb.Append("{\"frame\":").Append(f.FrameIndex);
                 sb.Append(",\"ts\":").Append(f.TimestampNs);

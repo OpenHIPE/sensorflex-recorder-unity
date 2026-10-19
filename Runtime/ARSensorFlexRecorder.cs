@@ -36,10 +36,10 @@ namespace SensorFlex.Recorder
         [Tooltip("Optional session identifier override. Leave empty to auto-generate.")]
         [SerializeField] string m_SessionId = "";
 
-        [Tooltip("Capture RGB frames (iOS only).")]
+        [Tooltip("Capture RGB frames (iOS and Android).")]
         [SerializeField] bool m_CaptureColor = true;
 
-        [Tooltip("Capture environment depth when supported (iOS only).")]
+        [Tooltip("Capture environment depth when supported (iOS and Android).")]
         [SerializeField] bool m_CaptureDepth = true;
 
         [Tooltip("Capture tracked camera pose.")]
@@ -63,6 +63,11 @@ namespace SensorFlex.Recorder
         [Min(0.1f)]
         [SerializeField] float m_DepthMaxMeters = 10f;
 
+        [Header("Android")]
+        [Tooltip("Switch ARCore to the highest-resolution camera configuration (up to 1920x1080) " +
+                 "during standby. ARCore's default CPU image is 640x480.")]
+        [SerializeField] bool m_AndroidPreferHighResCpuImage = true;
+
         [Header("Controls")]
         [SerializeField] bool m_RecordOnStart;
 
@@ -81,6 +86,7 @@ namespace SensorFlex.Recorder
         internal SfzRgbCodec   RgbCodec       => m_RgbCodec;
         internal SfzDepthCodec DepthCodec     => m_DepthCodec;
         internal float         DepthMaxMeters => m_DepthMaxMeters;
+        internal bool          AndroidPreferHighResCpuImage => m_AndroidPreferHighResCpuImage;
 
         internal string SessionId           => string.IsNullOrEmpty(m_SessionId)
                                                   ? (ActiveSessionId ?? Guid.NewGuid().ToString("N"))

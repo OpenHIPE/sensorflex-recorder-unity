@@ -6,6 +6,7 @@ using AOT;
 #if UNITY_ANDROID && !UNITY_EDITOR
 using System.Collections.Concurrent;
 using System.IO;
+using Unity.Collections.LowLevel.Unsafe;
 using UnityEngine;
 #endif
 
@@ -20,6 +21,8 @@ namespace SensorFlex.Recorder
     //     or StartDepthVideoSession
     //   AppendRgbFrame / AppendDepthLz4Frame           (each frame, main thread)
     //     or AppendDepthVideoFrame
+    //   (Android: AcquireRgbSlot + SubmitRgbSlot / AcquireDepthVideoSlot + SubmitDepthVideoSlot
+    //    replace the Append*Frame calls for video; StartDepthLz4Writer takes bytesPerPixel.)
     //   FinishRgbSession / FinishDepthSession           (at StopCapture)
     //   WaitForBothFinished                             (in ArchiveFinalizer, background thread)
     internal static class NativeVideoEncoder
@@ -151,23 +154,67 @@ namespace SensorFlex.Recorder
         enum DepthMode { None, Lz4, Video }
         static DepthMode _depthMode;
 
-        // ── Android Java objects ───────────────────────────────────────────────
+        // ── Java encoders + direct-ByteBuffer slot rings ───────────────────────
+        //
+        // Each SFVideoEncoderAndroid owns SlotCount direct ByteBuffers holding one tightly
+        // packed NV12 frame each. C# caches their native addresses once, writes a frame
+        // straight into a free slot, and submits the slot index — no managed arrays cross
+        // JNI. When every slot is in flight, AcquireSlot returns -1 and the caller drops
+        // the frame (bounded memory).
 
-        static AndroidJavaObject _rgbEncoder;
-        static AndroidJavaObject _depthVideoEncoder;
-        static float             _depthVideoScale = 255.0f / 10.0f;
+        const int SlotCount = 4;
 
-        // Pre-allocated marshal buffers for RGB (allocated at StartRgbSession).
-        static byte[] _yBuf;
-        static byte[] _uvBuf;
-        static int    _rgbWidth, _rgbHeight;
+        sealed class SlotEncoder
+        {
+            readonly AndroidJavaObject   _java;
+            readonly AndroidJavaObject[] _slotRefs = new AndroidJavaObject[SlotCount];
+            readonly IntPtr[]            _slotPtrs = new IntPtr[SlotCount];
+            AndroidDoneProxy             _doneProxy;   // kept alive until the callback fires
 
-        // Depth LZ4 producer-consumer.
+            public unsafe SlotEncoder(string mp4Path, int width, int height, int codec, bool isDepth)
+            {
+                _java = new AndroidJavaObject("com.sensorflex.recorder.SFVideoEncoderAndroid");
+                bool ok = _java.Call<bool>("start", mp4Path, width, height, codec, isDepth, SlotCount);
+                if (!ok) return;
+                for (int i = 0; i < SlotCount; i++)
+                {
+                    _slotRefs[i] = _java.Call<AndroidJavaObject>("getSlot", i);
+                    _slotPtrs[i] = (IntPtr)AndroidJNI.GetDirectBufferAddress(_slotRefs[i].GetRawObject());
+                }
+            }
+
+            public int Acquire(out IntPtr dst)
+            {
+                int slot = _java.Call<int>("acquireSlot");
+                dst = slot >= 0 ? _slotPtrs[slot] : IntPtr.Zero;
+                if (slot >= 0 && dst == IntPtr.Zero) { _java.Call("releaseSlot", slot); return -1; }
+                return slot;
+            }
+
+            public bool Submit(int slot, long timestampNs)
+                => _java.Call<bool>("submitSlot", slot, timestampNs / 1000L);
+
+            public void Finish(ManualResetEventSlim done)
+            {
+                _doneProxy = new AndroidDoneProxy(done);
+                _java.Call("finish", _doneProxy);
+            }
+        }
+
+        static SlotEncoder _rgbEncoder;
+        static SlotEncoder _depthVideoEncoder;
+
+        // ── Depth LZ4 producer-consumer (bounded, pooled buffers) ──────────────
+
+        const int DepthPoolSize = 8;
+
         static BlockingCollection<byte[]> _depthLz4Queue;
+        static ConcurrentQueue<byte[]>    _depthLz4Free;
         static Thread                     _depthLz4Thread;
         static FileStream                 _depthBinStream;
         static FileStream                 _depthSizStream;
-        static int                        _depthLz4Width, _depthLz4Height;
+        static int                        _depthLz4RowBytes;
+        static int                        _depthLz4FrameBytes;
         static byte[]                     _depthLz4EncodeBuf;
 
         // Completion events.
@@ -183,12 +230,16 @@ namespace SensorFlex.Recorder
                 : base("com.sensorflex.recorder.IEncoderDoneListener")
             { _done = done; }
 
-            void onEncoderDone(bool success) => _done.Set();
+            void onEncoderDone(bool success)
+            {
+                if (!success) Debug.LogWarning("[SF] Android encoder finished with errors.");
+                _done.Set();
+            }
         }
 
         // ── Public API ─────────────────────────────────────────────────────────
 
-        public static void PrewarmEncoders() { }   // Android VT warmup not needed; MediaCodec starts fast
+        public static void PrewarmEncoders() { }   // MediaCodec starts fast; no warm-up needed
         public static bool IsRgbReady        => true;
         public static bool IsDepthVideoReady => true;
 
@@ -210,57 +261,49 @@ namespace SensorFlex.Recorder
             }
         }
 
+        // ── RGB ────────────────────────────────────────────────────────────────
+
         public static void StartRgbSession(string mp4Path, int width, int height, SfzRgbCodec codec)
         {
             _rgbDone.Reset();
-            _depthDone.Reset();
+            _depthDone.Reset();  // Reset at session start so WaitForBothFinished works even if depth never starts
             _depthMode  = DepthMode.None;
-            _rgbWidth   = width;
-            _rgbHeight  = height;
-            _yBuf       = new byte[width * height];
-            _uvBuf      = new byte[width * (height / 2)];
-
-            _rgbEncoder = new AndroidJavaObject("com.sensorflex.recorder.SFVideoEncoderAndroid");
-            _rgbEncoder.Call("start", mp4Path, width, height, (int)codec, false);
+            _rgbEncoder = new SlotEncoder(mp4Path, width, height, (int)codec, isDepth: false);
         }
 
-        public static bool AppendRgbFrame(IntPtr pY, int strideY, IntPtr pCbCr, int strideCbCr,
-                                           int width, int height, long timestampNs)
+        // Returns a slot index and the address to write one NV12 frame into, or -1 if busy.
+        public static int AcquireRgbSlot(out IntPtr dst)
         {
-            if (_rgbEncoder == null || _yBuf == null) return false;
-            // Marshal Y plane row-by-row into pre-allocated buffer.
-            unsafe
-            {
-                byte* srcY = (byte*)pY;
-                for (int row = 0; row < height; row++)
-                    Marshal.Copy((IntPtr)(srcY + row * strideY), _yBuf, row * width, width);
-                byte* srcUV = (byte*)pCbCr;
-                int uvRows = height / 2;
-                for (int row = 0; row < uvRows; row++)
-                    Marshal.Copy((IntPtr)(srcUV + row * strideCbCr), _uvBuf, row * width, width);
-            }
-            return _rgbEncoder.Call<bool>("appendFrame", _yBuf, _uvBuf, timestampNs / 1000L);
+            dst = IntPtr.Zero;
+            return _rgbEncoder != null ? _rgbEncoder.Acquire(out dst) : -1;
         }
+
+        public static bool SubmitRgbSlot(int slot, long timestampNs)
+            => _rgbEncoder != null && _rgbEncoder.Submit(slot, timestampNs);
 
         public static void FinishRgbSession()
         {
-            if (_rgbEncoder == null) { _rgbDone.Set(); return; }
-            var proxy = new AndroidDoneProxy(_rgbDone);
-            _rgbEncoder.Call("finish", proxy);
+            var enc = _rgbEncoder;
+            _rgbEncoder = null;
+            if (enc == null) { _rgbDone.Set(); return; }
+            enc.Finish(_rgbDone);
         }
 
-        public static void StartDepthLz4Writer(string binPath, string sizesPath, int width, int height,
-                                                SfzDepthCodec codec = SfzDepthCodec.LZ4)
-        {
-            if (codec == SfzDepthCodec.Zstd)
-                Debug.LogWarning("[SF] Zstd depth not yet implemented on Android — recording as LZ4.");
-            _depthMode     = DepthMode.Lz4;
-            _depthLz4Width  = width;
-            _depthLz4Height = height;
-            _depthLz4Queue  = new BlockingCollection<byte[]>(64);
+        // ── Depth LZ4 (uint16 or float32 rows, bytesPerPixel) ──────────────────
 
-            int maxEncoded = width * height * 4 + (width * height * 4 >> 3) + 256;
-            _depthLz4EncodeBuf = new byte[maxEncoded];
+        public static void StartDepthLz4Writer(string binPath, string sizesPath, int width, int height,
+                                                int bytesPerPixel)
+        {
+            _depthMode          = DepthMode.Lz4;
+            _depthDone.Reset();
+            _depthLz4RowBytes   = width * bytesPerPixel;
+            _depthLz4FrameBytes = _depthLz4RowBytes * height;
+            _depthLz4EncodeBuf  = new byte[_depthLz4FrameBytes + (_depthLz4FrameBytes >> 3) + 256];
+
+            _depthLz4Queue = new BlockingCollection<byte[]>(DepthPoolSize);
+            _depthLz4Free  = new ConcurrentQueue<byte[]>();
+            for (int i = 0; i < DepthPoolSize; i++)
+                _depthLz4Free.Enqueue(new byte[_depthLz4FrameBytes]);
 
             _depthBinStream = new FileStream(binPath,   FileMode.Create, FileAccess.Write, FileShare.None, 65536);
             _depthSizStream = new FileStream(sizesPath, FileMode.Create, FileAccess.Write, FileShare.None, 4096);
@@ -269,56 +312,46 @@ namespace SensorFlex.Recorder
             _depthLz4Thread.Start();
         }
 
-        public static bool AppendDepthLz4Frame(IntPtr pF32, int stride, int width, int height)
+        // Copies one de-strided frame into a pooled buffer and queues it. false = dropped.
+        public static unsafe bool AppendDepthLz4Frame(IntPtr src, int rowStride, int width, int height)
         {
             if (_depthLz4Queue == null || _depthLz4Queue.IsAddingCompleted) return false;
-            int srcSize = width * height * 4;
-            var buf = new byte[srcSize];
-            unsafe
+            if (!_depthLz4Free.TryDequeue(out var buf)) return false;
+
+            fixed (byte* d = buf)
             {
-                byte* src = (byte*)pF32;
-                for (int row = 0; row < height; row++)
-                    Marshal.Copy((IntPtr)(src + row * stride), buf, row * width * 4, width * 4);
+                byte* s = (byte*)src;
+                if (rowStride == _depthLz4RowBytes)
+                    UnsafeUtility.MemCpy(d, s, _depthLz4FrameBytes);
+                else
+                    for (int row = 0; row < height; row++)
+                        UnsafeUtility.MemCpy(d + row * _depthLz4RowBytes, s + row * rowStride, _depthLz4RowBytes);
             }
-            return _depthLz4Queue.TryAdd(buf);
+
+            if (_depthLz4Queue.TryAdd(buf)) return true;
+            _depthLz4Free.Enqueue(buf);
+            return false;
         }
+
+        // ── Depth video (NV12 slots, uint8-normalised by the caller) ───────────
 
         public static void StartDepthVideoSession(string mp4Path, int width, int height,
                                                    SfzDepthCodec codec, float depthMaxMeters)
         {
-            _depthMode       = DepthMode.Video;
-            _depthVideoScale = 255.0f / (depthMaxMeters > 0f ? depthMaxMeters : 10f);
+            _depthMode = DepthMode.Video;
             _depthDone.Reset();
-
-            // For video depth on Android, normalise float32 to uint8 before passing to Java encoder.
-            _depthVideoEncoder = new AndroidJavaObject("com.sensorflex.recorder.SFVideoEncoderAndroid");
-            _depthVideoEncoder.Call("start", mp4Path, width, height, (int)codec == 1 ? 1 : 0, true);
+            int javaCodec = codec == SfzDepthCodec.HEVC ? 1 : 0;
+            _depthVideoEncoder = new SlotEncoder(mp4Path, width, height, javaCodec, isDepth: true);
         }
 
-        public static bool AppendDepthVideoFrame(IntPtr pF32, int stride, int width, int height, long tsNs)
+        public static int AcquireDepthVideoSlot(out IntPtr dst)
         {
-            if (_depthVideoEncoder == null) return false;
-            // Normalise float metres to uint8 Y plane; neutral CbCr.
-            var yBuf  = new byte[width * height];
-            var uvBuf = new byte[width * (height / 2)];
-            unsafe
-            {
-                float* src   = (float*)pF32;
-                float  scale = _depthVideoScale;
-                for (int row = 0; row < height; row++)
-                {
-                    float* srcRow = (float*)((byte*)src + row * stride);
-                    for (int col = 0; col < width; col++)
-                    {
-                        float d = srcRow[col] * scale;
-                        yBuf[row * width + col] = (byte)(d < 0f ? 0 : d > 255f ? 255 : d);
-                    }
-                }
-            }
-            // Fill CbCr with 128 (neutral chroma).
-            for (int i = 0; i < uvBuf.Length; i++) uvBuf[i] = 128;
-            return _depthVideoEncoder.Call<bool>("appendFrame", yBuf, uvBuf, tsNs / 1000L);
+            dst = IntPtr.Zero;
+            return _depthVideoEncoder != null ? _depthVideoEncoder.Acquire(out dst) : -1;
         }
+
+        public static bool SubmitDepthVideoSlot(int slot, long timestampNs)
+            => _depthVideoEncoder != null && _depthVideoEncoder.Submit(slot, timestampNs);
 
         // Unified finish for whichever depth encoder is active.
         public static void FinishDepthSession()
@@ -330,23 +363,23 @@ namespace SensorFlex.Recorder
                     _depthLz4Thread?.Join();
                     _depthBinStream?.Close();
                     _depthSizStream?.Close();
+                    _depthLz4Queue  = null;
+                    _depthLz4Thread = null;
+                    _depthBinStream = null;
+                    _depthSizStream = null;
                     _depthDone.Set();
                     break;
                 case DepthMode.Video:
-                    if (_depthVideoEncoder != null)
-                    {
-                        var proxy = new AndroidDoneProxy(_depthDone);
-                        _depthVideoEncoder.Call("finish", proxy);
-                    }
-                    else
-                    {
-                        _depthDone.Set();
-                    }
+                    var enc = _depthVideoEncoder;
+                    _depthVideoEncoder = null;
+                    if (enc != null) enc.Finish(_depthDone);
+                    else             _depthDone.Set();
                     break;
                 default:
                     _depthDone.Set();
                     break;
             }
+            _depthMode = DepthMode.None;
         }
 
         public static void WaitForBothFinished(int timeoutMs)
@@ -363,18 +396,21 @@ namespace SensorFlex.Recorder
             foreach (var rawFrame in _depthLz4Queue.GetConsumingEnumerable())
             {
                 int encoded = Lz4BlockEncoder.Encode(
-                    rawFrame, 0, rawFrame.Length,
+                    rawFrame, 0, _depthLz4FrameBytes,
                     _depthLz4EncodeBuf, 0, _depthLz4EncodeBuf.Length);
+                _depthLz4Free.Enqueue(rawFrame);
 
+                // Always write a size entry (0 on failure) so depth_sizes.bin stays aligned
+                // with frames that reported HasDepth = true.
                 if (encoded > 0)
-                {
                     _depthBinStream.Write(_depthLz4EncodeBuf, 0, encoded);
-                    sizeBytes[0] = (byte)(encoded         & 0xFF);
-                    sizeBytes[1] = (byte)((encoded >>  8) & 0xFF);
-                    sizeBytes[2] = (byte)((encoded >> 16) & 0xFF);
-                    sizeBytes[3] = (byte)((encoded >> 24) & 0xFF);
-                    _depthSizStream.Write(sizeBytes, 0, 4);
-                }
+                else
+                    encoded = 0;
+                sizeBytes[0] = (byte)(encoded         & 0xFF);
+                sizeBytes[1] = (byte)((encoded >>  8) & 0xFF);
+                sizeBytes[2] = (byte)((encoded >> 16) & 0xFF);
+                sizeBytes[3] = (byte)((encoded >> 24) & 0xFF);
+                _depthSizStream.Write(sizeBytes, 0, 4);
             }
         }
 

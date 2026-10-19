@@ -32,6 +32,8 @@ namespace SensorFlex.Recorder
         public bool   HasDepth;
         public int    DepthWidth, DepthHeight;
         public string      DepthSensor;    // e.g. "arkit_lidar", "arcore_environment_depth"
+        public string      DepthEncoding;  // e.g. "lz4_float32", "lz4_uint16" — from CaptureBackend
+        public string      DepthUnits;     // "meters" or "millimeters"
         public SfzRgbCodec   RgbCodec;
         public SfzDepthCodec DepthCodec;
         public float         DepthMaxMeters;

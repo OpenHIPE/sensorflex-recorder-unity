@@ -217,8 +217,10 @@ int32_t SFDepthLz4_AppendFrame(void *pF32, int32_t stride,
                                                 NULL, gDepthBinAlgo);
         free(buf);
 
-        if (compLen > 0 && gDepthBinFile && gDepthSizFile) {
-            fwrite(dst, 1, compLen, gDepthBinFile);
+        // Always write a size entry (0 on failure) so depth_sizes.bin stays aligned
+        // with frames that reported HasDepth = true.
+        if (gDepthBinFile && gDepthSizFile) {
+            if (compLen > 0) fwrite(dst, 1, compLen, gDepthBinFile);
             int32_t len32 = (int32_t)compLen;
             fwrite(&len32, sizeof(int32_t), 1, gDepthSizFile);
         }
